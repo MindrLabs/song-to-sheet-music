@@ -1,0 +1,1400 @@
+controller:
+  adapter:
+    type: http-server
+    port: ${env.PORT | 8080}
+    base_path: /api
+  webui:
+    driver: gradio
+    port: ${env.SERVER_PORT | 8081}
+
+workflows:
+  # ── The whole pipeline ──────────────────────────────────────────────
+  - id: full
+    title: Song to Sheet Music
+    default: true
+    description: |
+      A song in, part scores out. Downloads the audio (or takes a local file),
+      splits it into per-instrument stems, and writes a part for each one it
+      can — drums, bass, guitar, piano and the sung melody — on one shared bar
+      grid, key and chord track.
+
+      Give either `url` (YouTube, or any site yt-dlp supports) or `audio` (a
+      path to a local file). `parts` picks the parts to write: `all` (the
+      default) or a comma-separated list of drums, bass, guitar, piano, vocals
+      — a part not listed is skipped, and its stages with it.
+
+      Each stage is also a workflow of its own, so a failing step can be
+      re-run in isolation without paying for the ones before it; each part is
+      a workflow too (part-drums, part-bass, …).
+
+      Optional inputs: `title` heads every part ("Song — Bass"; the part's
+      name alone without it), `key` sets the key instead of estimating it,
+      `language` (en, ja, yue, zh) tells the vocal transcriber what is sung,
+      `vocal_model` picks its size (small, medium, large) and `lyrics_language`
+      (ko, en, ...; Whisper tells by itself without it) steers the lyrics under
+      the sung melody.
+    jobs:
+      # ── The source: a download, or a local file ─────────────────────────────
+      # Either way the song lands in ./output/01-source.flac first, and every
+      # later stage opens that saved copy by path. (The downloader returns one
+      # self-deleting temp file, and jobs that read it directly would race for
+      # it; saving first also means the stages below can be re-run against
+      # ./output without downloading again.)
+      #
+      # `pick-source` routes to one of the two jobs below; the other never runs.
+      # Jobs that need the song depend on "either of them" (a nested list).
+      - id: pick-source
+        type: if
+        input: ${input.audio | }
+        conditions:
+          - operator: match
+            value: "\\S"
+            if_true: copy-source
+        otherwise: get-source
+
+      - id: get-source
+        component: run
+        action: download
+        input:
+          url: ${input.url}
+          name: 01-source
+
+      # A local file is converted to FLAC (lossless, any format FFmpeg reads)
+      # and saved under the same name the download would get. One job, as a
+      # branch of pick-source has to be.
+      - id: copy-source
+        type: pipeline
+        input: ${input.audio}
+        steps:
+          - component: source-converter
+            input:
+              audio: ${input}
+          - component: store
+            input:
+              path: 01-source.flac
+              source: ${output}
+
+      # ── Song-wide: beats and bars, key, chords, stems ──────────────────────
+      # Beats and bar lines come off the full mix, not a stem: the model was
+      # trained on mixes, and the drums carry the beat.
+      - id: tempo
+        component: beat-tracker
+        input:
+          audio: ${input.source as audio;path | output/01-source.flac}
+        depends_on: [ [ get-source, copy-source ] ]
+
+      # Every part draws its bar lines from this one file, so bar numbers agree
+      # across parts.
+      - id: save-tempo
+        component: store
+        input:
+          path: tempo.json
+          source: ${jobs.tempo.output as text}
+        depends_on: [ tempo ]
+
+      # One key for the song; every pitched part takes its key signature from it.
+      - id: key
+        component: key-estimator
+        input:
+          audio: output/01-source.flac
+          out: output/key.json
+          key: ${input.key as text | auto}
+        depends_on: [ [ get-source, copy-source ] ]
+
+      # Chords on the bar grid, once for the song; the bass, guitar and vocal
+      # parts print them, the drum part reads the song's sections off them.
+      - id: chords
+        component: chord-estimator
+        input:
+          out: output/chords.json
+          audio: output/01-source.flac
+          tempo: output/tempo.json
+          key: output/key.json
+        depends_on: [ save-tempo, key ]
+
+      # Six stems.
+      - id: separate
+        component: stem-splitter
+        input:
+          audio: ${input.source as audio;path | output/01-source.flac}
+        depends_on: [ [ get-source, copy-source ] ]
+
+      - id: save-bass
+        component: store
+        input: { path: stems/bass.wav, source: "${jobs.separate.output.bass as audio/wav}" }
+        depends_on: [ separate ]
+      - id: save-drums
+        component: store
+        input: { path: stems/drums.wav, source: "${jobs.separate.output.drums as audio/wav}" }
+        depends_on: [ separate ]
+      - id: save-other
+        component: store
+        input: { path: stems/other.wav, source: "${jobs.separate.output.other as audio/wav}" }
+        depends_on: [ separate ]
+      - id: save-vocals
+        component: store
+        input: { path: stems/vocals.wav, source: "${jobs.separate.output.vocals as audio/wav}" }
+        depends_on: [ separate ]
+      - id: save-guitar
+        component: store
+        input: { path: stems/guitar.wav, source: "${jobs.separate.output.guitar as audio/wav}" }
+        depends_on: [ separate ]
+      - id: save-piano
+        component: store
+        input: { path: stems/piano.wav, source: "${jobs.separate.output.piano as audio/wav}" }
+        depends_on: [ separate ]
+
+      # ── The parts, each one a workflow of its own ──────────────────────────
+      # `pick-<part>` runs the part when `parts` is `all` or names it; a part
+      # not named is skipped — its router routes nowhere, so the part's
+      # workflow never starts, and the output below reports it as null. The
+      # five routers are evaluated as soon as their stems are saved, so the
+      # parts still run side by side.
+      - id: pick-drums
+        type: if
+        input: ${input.parts | all}
+        conditions:
+          - operator: match
+            value: "^(all$|.*\\bdrums\\b)"
+            if_true: part-drums
+        depends_on: [ save-drums, save-tempo, chords ]
+      - id: part-drums
+        component: run
+        action: part-drums
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+
+      - id: pick-bass
+        type: if
+        input: ${input.parts | all}
+        conditions:
+          - operator: match
+            value: "^(all$|.*\\bbass\\b)"
+            if_true: part-bass
+        depends_on: [ save-bass, save-tempo, key, chords ]
+      - id: part-bass
+        component: run
+        action: part-bass
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          tab: ${input.tab as text | true}
+
+      - id: pick-guitar
+        type: if
+        input: ${input.parts | all}
+        conditions:
+          - operator: match
+            value: "^(all$|.*\\bguitar\\b)"
+            if_true: part-guitar
+        depends_on: [ save-guitar, save-tempo, key, chords ]
+      - id: part-guitar
+        component: run
+        action: part-guitar
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          tab: ${input.tab as text | true}
+
+      - id: pick-piano
+        type: if
+        input: ${input.parts | all}
+        conditions:
+          - operator: match
+            value: "^(all$|.*\\bpiano\\b)"
+            if_true: part-piano
+        depends_on: [ save-piano, save-tempo, key ]
+      - id: part-piano
+        component: run
+        action: part-piano
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          bpm: ${input.bpm as text | auto}
+          min_pitch: ${input.min_pitch as text | 36}
+
+      - id: pick-vocals
+        type: if
+        input: ${input.parts | all}
+        conditions:
+          - operator: match
+            value: "^(all$|.*\\bvocals\\b)"
+            if_true: part-vocals
+        depends_on: [ save-vocals, save-tempo, key, chords ]
+      - id: part-vocals
+        component: run
+        action: part-vocals
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          model: ${input.vocal_model | small}
+          language: ${input.language | }
+          lyrics_language: ${input.lyrics_language | }
+
+    output:
+      # Each part's first page first, so the web UI shows the parts themselves
+      # right under the Run button. Null for a part not asked for or not found
+      # in the song.
+      drums_page: ${jobs.part-drums.output.render.first_page as image;path}
+      bass_page: ${jobs.part-bass.output.render.first_page as image;path}
+      guitar_page: ${jobs.part-guitar.output.guitar.render.first_page as image;path}
+      guitar_rhythm_page: ${jobs.part-guitar.output.rhythm.render.first_page as image;path}
+      piano_page: ${jobs.part-piano.output.render.first_page as image;path}
+      vocals_page: ${jobs.part-vocals.output.render.first_page as image;path}
+      key: ${jobs.key.output.result as json}
+      chords: ${jobs.chords.output.result as json}
+      drums: ${jobs.part-drums.output as json}
+      bass: ${jobs.part-bass.output as json}
+      guitar: ${jobs.part-guitar.output.guitar as json}
+      guitar_rhythm: ${jobs.part-guitar.output.rhythm as json}
+      piano: ${jobs.part-piano.output as json}
+      vocals: ${jobs.part-vocals.output as json}
+
+  # ── The parts ───────────────────────────────────────────────────────────────
+  # One workflow per part, chaining the stage workflows below. `full` runs the
+  # ones asked for; each can also be run on its own against a ./output that
+  # already holds the stems, tempo.json, key.json and chords.json.
+  - id: part-drums
+    title: Drum Part
+    description: |
+      Split ./output/stems/drums.wav into kick, snare, toms, hi-hat, ride and
+      crash, then engrave the drum part from the pieces. Needs tempo.json and
+      chords.json in ./output.
+    jobs:
+      - id: split
+        component: run
+        action: split-drums
+        input:
+          audio: output/stems/drums.wav
+      - id: engrave
+        component: run
+        action: engrave-drums
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+        depends_on: [ split ]
+    output: ${jobs.engrave.output}
+
+  - id: part-bass
+    title: Bass Part
+    description: |
+      Transcribe ./output/stems/bass.wav and engrave the bass part, with
+      tablature unless `tab` is false. Needs tempo.json, key.json and
+      chords.json in ./output.
+    jobs:
+      - id: transcribe
+        component: run
+        action: transcribe-bass
+        input:
+          audio: output/stems/bass.wav
+      - id: engrave
+        component: run
+        action: engrave-bass
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          tab: ${input.tab as text | true}
+        depends_on: [ transcribe ]
+    output: ${jobs.engrave.output}
+
+  - id: part-guitar
+    title: Guitar Parts
+    description: |
+      Transcribe ./output/stems/guitar.wav and engrave the guitar part (notes,
+      with tablature unless `tab` is false) and the rhythm chart (chord symbols
+      over rhythm slashes). Needs tempo.json, key.json and chords.json in
+      ./output.
+    jobs:
+      - id: transcribe
+        component: run
+        action: transcribe-guitar
+        input:
+          audio: output/stems/guitar.wav
+      - id: engrave
+        component: run
+        action: engrave-guitar
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          tab: ${input.tab as text | true}
+        depends_on: [ transcribe ]
+      - id: rhythm
+        component: run
+        action: engrave-guitar-rhythm
+        input:
+          title: ${input.title | }
+    output:
+      guitar: ${jobs.engrave.output}
+      rhythm: ${jobs.rhythm.output}
+
+  - id: part-piano
+    title: Piano Part
+    description: |
+      Transcribe ./output/stems/piano.wav and engrave the piano part on a grand
+      staff. Needs tempo.json and key.json in ./output.
+    jobs:
+      - id: transcribe
+        component: run
+        action: transcribe
+        input:
+          audio: output/stems/piano.wav
+          name: piano
+      - id: engrave
+        component: run
+        action: engrave
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+          bpm: ${input.bpm as text | auto}
+          min_pitch: ${input.min_pitch as text | 36}
+        depends_on: [ transcribe ]
+    output: ${jobs.engrave.output}
+
+  - id: part-vocals
+    title: Vocal Part
+    description: |
+      Transcribe the sung melody from ./output/stems/vocals.wav, hear the words
+      over it, and engrave a lead sheet: the melody with chord symbols above
+      and the lyrics under it. Needs tempo.json, key.json and chords.json in
+      ./output.
+    jobs:
+      - id: transcribe
+        component: run
+        action: transcribe-vocals
+        input:
+          model: ${input.model | small}
+          language: ${input.language | }
+      - id: lyrics
+        component: run
+        action: transcribe-lyrics
+        input:
+          language: ${input.lyrics_language | }
+        depends_on: [ transcribe ]
+      - id: engrave
+        component: run
+        action: engrave-vocals
+        input:
+          title: ${input.title | }
+          grid: ${input.grid as text | 4}
+        depends_on: [ lyrics ]
+    output:
+      notes: ${jobs.transcribe.output}
+      lyrics: ${jobs.lyrics.output}
+      score: ${jobs.engrave.output.score}
+      render: ${jobs.engrave.output.render}
+
+  # ── Phase 0 ────────────────────────────────────────────────────────────────
+  - id: download
+    title: Download Audio
+    description: |
+      Fetch audio from a URL with yt-dlp. Any site yt-dlp supports works, not
+      just YouTube. Saved to ./output so the later stages can run against the
+      file instead of re-downloading.
+    jobs:
+      - id: fetch
+        component: downloader
+        input:
+          url: ${input.url}
+
+      - id: save
+        component: store
+        input:
+          path: ${input.name | source}.${input.format | flac}
+          source: ${jobs.fetch.output}
+        output: ${output}
+        depends_on: [ fetch ]
+
+    output: ${jobs.save.output}
+
+  # ── Phase 1 ────────────────────────────────────────────────────────────────
+  - id: separate
+    title: Separate Stems
+    description: |
+      Split a track into six stems (bass, drums, other, vocals, guitar, piano)
+      with BS-Roformer-SW and write each to ./output/stems. Kept runnable on its
+      own so later stages can work against the saved stems instead of
+      re-separating every time.
+
+      `audio` is a path, e.g. output/01-source.flac. Any sample rate or channel
+      count; the splitter works at 44.1 kHz stereo.
+    jobs:
+      - id: split
+        component: stem-splitter
+        input:
+          audio: ${input.audio as audio;path}
+      - id: save-bass
+        component: store
+        input: { path: stems/bass.wav, source: "${jobs.split.output.bass as audio/wav}" }
+        depends_on: [ split ]
+      - id: save-drums
+        component: store
+        input: { path: stems/drums.wav, source: "${jobs.split.output.drums as audio/wav}" }
+        depends_on: [ split ]
+      - id: save-other
+        component: store
+        input: { path: stems/other.wav, source: "${jobs.split.output.other as audio/wav}" }
+        depends_on: [ split ]
+      - id: save-vocals
+        component: store
+        input: { path: stems/vocals.wav, source: "${jobs.split.output.vocals as audio/wav}" }
+        depends_on: [ split ]
+      - id: save-guitar
+        component: store
+        input: { path: stems/guitar.wav, source: "${jobs.split.output.guitar as audio/wav}" }
+        depends_on: [ split ]
+      - id: save-piano
+        component: store
+        input: { path: stems/piano.wav, source: "${jobs.split.output.piano as audio/wav}" }
+        depends_on: [ split ]
+
+    output:
+      bass:   ${jobs.save-bass.output}
+      drums:  ${jobs.save-drums.output}
+      other:  ${jobs.save-other.output}
+      vocals: ${jobs.save-vocals.output}
+      guitar: ${jobs.save-guitar.output}
+      piano:  ${jobs.save-piano.output}
+
+  # ── Phase 1b: drum pieces ────────────────────────────────────────────────
+  - id: split-drums
+    title: Split Drums
+    description: |
+      Split a drum stem into kick, snare, toms, hi-hat, ride and crash with
+      MDX23C DrumSep and write each to ./output/stems/drums.
+
+      `audio` is a path, e.g. output/stems/drums.wav.
+    jobs:
+      - id: split
+        component: drum-splitter
+        input:
+          audio: ${input.audio as audio;path}
+          num_overlap: ${input.num_overlap | 2}
+
+      - id: save-kick
+        component: store
+        input:
+          path: stems/drums/kick.wav
+          source: ${jobs.split.output.Kick as audio/wav}
+        depends_on: [ split ]
+      - id: save-snare
+        component: store
+        input:
+          path: stems/drums/snare.wav
+          source: ${jobs.split.output.Snare as audio/wav}
+        depends_on: [ split ]
+      - id: save-toms
+        component: store
+        input:
+          path: stems/drums/toms.wav
+          source: ${jobs.split.output.Toms as audio/wav}
+        depends_on: [ split ]
+      - id: save-hh
+        component: store
+        input:
+          path: stems/drums/hh.wav
+          source: ${jobs.split.output.Hh as audio/wav}
+        depends_on: [ split ]
+      - id: save-ride
+        component: store
+        input:
+          path: stems/drums/ride.wav
+          source: ${jobs.split.output.Ride as audio/wav}
+        depends_on: [ split ]
+      - id: save-crash
+        component: store
+        input:
+          path: stems/drums/crash.wav
+          source: ${jobs.split.output.Crash as audio/wav}
+        depends_on: [ split ]
+
+  # ── Phase 2 ────────────────────────────────────────────────────────────────
+  - id: transcribe
+    title: Transcribe One Stem
+    description: |
+      Turn a single stem into note events and a MIDI file. Takes one stem at a
+      time so each instrument can be judged on its own.
+
+      `audio` is a path, e.g. output/stems/piano.wav.
+    jobs:
+      - id: transcribe
+        component: transcriber
+        input:
+          audio: ${input.audio as audio;path}
+
+      - id: save-midi
+        component: store
+        input:
+          path: ${input.name | stem}.mid
+          source: ${jobs.transcribe.output.midi}
+        output: ${output}
+        depends_on: [ transcribe ]
+      - id: save-notes
+        component: store
+        input:
+          path: ${input.name | stem}.notes.json
+          source: ${jobs.transcribe.output.notes as text}
+        depends_on: [ transcribe ]
+
+    output:
+      midi:  ${jobs.save-midi.output}
+      notes: ${jobs.transcribe.output.notes as json}
+
+  # ── Phase 2b: bass ────────────────────────────────────────────────────────
+  - id: transcribe-bass
+    title: Transcribe the Bass
+    description: |
+      Transcribe the bass stem with basic-pitch and save its note events and
+      MIDI to ./output. The pitch range is a bass guitar's (B0 to about G4)
+      so the stem's overtones and bleed above it are not read as notes.
+
+      `audio` is a path, e.g. output/stems/bass.wav.
+    jobs:
+      - id: transcribe
+        component: pitch-transcriber
+        input:
+          audio: ${input.audio as audio;path}
+          minimum_frequency: ${input.minimum_frequency | 30}
+          maximum_frequency: ${input.maximum_frequency | 400}
+
+      - id: save-notes
+        component: store
+        input:
+          path: bass.notes.json
+          source: ${jobs.transcribe.output.notes as text}
+        depends_on: [ transcribe ]
+
+      # The transcriber's own MIDI, before the engraver keeps one note at a time
+      # and fixes octaves; engrave-bass writes the cleaned bass.mid.
+      - id: save-midi
+        component: store
+        input:
+          path: bass.raw.mid
+          source: ${jobs.transcribe.output.midi}
+        depends_on: [ transcribe ]
+
+    output:
+      notes: ${jobs.save-notes.output}
+      midi:  ${jobs.save-midi.output}
+
+  # ── Phase 2c: guitar ─────────────────────────────────────────────────────
+  - id: transcribe-guitar
+    title: Transcribe the Guitar
+    description: |
+      Transcribe the guitar stem with basic-pitch and save its note events and
+      MIDI to ./output. The pitch range is a guitar's: a drop-D or half-step-
+      down low string (about 70 Hz) to the 24th fret (about 1.4 kHz).
+
+      `audio` is a path, e.g. output/stems/guitar.wav.
+    jobs:
+      - id: transcribe
+        component: pitch-transcriber
+        input:
+          audio: ${input.audio as audio;path}
+          minimum_frequency: ${input.minimum_frequency | 70}
+          maximum_frequency: ${input.maximum_frequency | 1400}
+
+      - id: save-notes
+        component: store
+        input:
+          path: guitar.notes.json
+          source: ${jobs.transcribe.output.notes as text}
+        depends_on: [ transcribe ]
+
+      - id: save-midi
+        component: store
+        input:
+          path: guitar.raw.mid
+          source: ${jobs.transcribe.output.midi}
+        depends_on: [ transcribe ]
+
+    output:
+      notes: ${jobs.save-notes.output}
+      midi:  ${jobs.save-midi.output}
+
+  - id: engrave-guitar-rhythm
+    title: Engrave the Guitar Rhythm Chart
+    description: |
+      Write the guitar's rhythm chart — the song's chord symbols from
+      ./output/chords.json over rhythm slashes read off the attacks of
+      ./output/stems/guitar.wav, on the bar grid in ./output/tempo.json — and
+      render it to SVG, PNG and PDF. For a strummed guitar it reads better than the
+      note-by-note guitar part; both are written.
+    jobs:
+      - id: build
+        component: rhythm-engraver
+        input:
+          audio:  ${input.audio | output/stems/guitar.wav}
+          out:    ${input.out | output/guitar-rhythm.musicxml}
+          tempo:  ${input.tempo | output/tempo.json}
+          key:    ${input.key | output/key.json}
+          chords: ${input.chords | output/chords.json}
+          title:  ${input.title | }
+
+      - id: render
+        component: score-image
+        input:
+          score: ${input.out | output/guitar-rhythm.musicxml}
+          out:   ${input.image_out | output/guitar-rhythm}
+        depends_on: [ build ]
+
+    output:
+      score:  ${jobs.build.output.result as json}
+      render: ${jobs.render.output.result as json}
+
+  - id: engrave-guitar
+    title: Engrave the Guitar Part
+    description: |
+      Write the guitar part from ./output/guitar.notes.json on the bar grid in
+      ./output/tempo.json, with the song's chord symbols from
+      ./output/chords.json above the staff, and render it to SVG, PNG and PDF.
+      Notes that start together stay together as chords; notes read off a
+      near-silent stem are dropped. Treble clef an octave up, the guitar's
+      convention.
+    jobs:
+      - id: build
+        component: guitar-engraver
+        input:
+          notes:  ${input.notes | output/guitar.notes.json}
+          out:    ${input.out | output/guitar.musicxml}
+          tempo:  ${input.tempo | output/tempo.json}
+          grid:   ${input.grid as text | 4}
+          audio:  ${input.audio | output/stems/guitar.wav}
+          key:    ${input.key | output/key.json}
+          chords: ${input.chords | output/chords.json}
+          tab:    ${input.tab as text | true}
+          title:  ${input.title | }
+
+      - id: render
+        component: score-image
+        input:
+          score: ${input.out | output/guitar.musicxml}
+          out:   ${input.image_out | output/guitar}
+        depends_on: [ build ]
+
+    output:
+      score:  ${jobs.build.output.result as json}
+      render: ${jobs.render.output.result as json}
+
+  - id: engrave-bass
+    title: Engrave the Bass Part
+    description: |
+      Write the bass part from ./output/bass.notes.json on the bar grid in
+      ./output/tempo.json, and render it to SVG, PNG and PDF. The stem is read too:
+      each note's octave is checked against its spectrum, and repeated notes
+      the transcriber merged are split at the stem's attacks. The chords in
+      ./output/chords.json go above the staff. Also writes bass.mid, the
+      cleaned line at sounding pitch.
+    jobs:
+      - id: build
+        component: line-engraver
+        input:
+          notes: ${input.notes | output/bass.notes.json}
+          out:   ${input.out | output/bass.musicxml}
+          tempo: ${input.tempo | output/tempo.json}
+          part:  bass
+          grid:  ${input.grid as text | 4}
+          audio: ${input.audio | output/stems/bass.wav}
+          key:   ${input.key | output/key.json}
+          chords: ${input.chords | output/chords.json}
+          lyrics: ""
+          tab:   ${input.tab as text | true}
+          title: ${input.title | }
+
+      - id: render
+        component: score-image
+        input:
+          score: ${input.out | output/bass.musicxml}
+          out:   ${input.image_out | output/bass}
+        depends_on: [ build ]
+
+    output:
+      score:  ${jobs.build.output.result as json}
+      render: ${jobs.render.output.result as json}
+
+  # ── Phase 2d: vocals ─────────────────────────────────────────────────────
+  - id: transcribe-vocals
+    title: Transcribe the Vocals
+    description: |
+      Transcribe the vocal stem with GAME, a singing transcriber, and save its
+      note events to ./output/vocals.notes.json. The model (small by default;
+      medium, large) downloads on first use, 46 to 362 MB.
+
+      `audio` is a path, e.g. output/stems/vocals.wav. `language` (en, ja,
+      yue, zh — GAME's training languages) is optional: on English songs it
+      made no measurable difference, and other languages work without it.
+    jobs:
+      - id: transcribe
+        component: vocal-transcriber
+        input:
+          audio:    ${input.audio | output/stems/vocals.wav}
+          out:      ${input.out | output/vocals.notes.json}
+          model:    ${input.model | small}
+          language: ${input.language | }
+
+    output: ${jobs.transcribe.output.result as json}
+
+  - id: transcribe-lyrics
+    title: Transcribe the Lyrics
+    description: |
+      Transcribe the sung words, each with its time, from the vocal stem and
+      save them to ./output/vocals.lyrics.json, for engrave-vocals to set under
+      the notes. Whisper (faster-whisper, large-v3-turbo by default, 1.6 GB on
+      first use) listens only where ./output/vocals.notes.json has notes.
+
+      `audio` and `notes` are paths. `language` (ko, en, ...) is optional;
+      Whisper tells by itself.
+    jobs:
+      - id: find-sung-spans
+        component: span-finder
+        input:
+          notes: ${input.notes | output/vocals.notes.json}
+          language: ${input.language | }
+
+      - id: transcribe
+        component: lyrics-transcriber
+        input:
+          audio: ${input.audio as audio;path | output/stems/vocals.wav}
+          span: ${jobs.find-sung-spans.output.result.spans}
+          language: ${jobs.find-sung-spans.output.result.language}
+        depends_on: [ find-sung-spans ]
+
+      - id: save
+        component: store
+        input:
+          path: ${input.out | vocals.lyrics.json}
+          source: ${jobs.transcribe.output as text}
+        depends_on: [ transcribe ]
+
+    output: ${jobs.transcribe.output as json}
+
+  - id: engrave-vocals
+    title: Engrave the Vocal Part
+    description: |
+      Write the sung melody from ./output/vocals.notes.json on the bar grid in
+      ./output/tempo.json, with the song's chord symbols from
+      ./output/chords.json above the staff and the words from
+      ./output/vocals.lyrics.json under it (transcribe-lyrics; left out when
+      the file is not there) — a lead sheet — and render it to SVG, PNG and
+      PDF. Treble clef, with an 8 below for a low (man's) line.
+    jobs:
+      - id: build
+        component: line-engraver
+        input:
+          notes:  ${input.notes | output/vocals.notes.json}
+          out:    ${input.out | output/vocals.musicxml}
+          tempo:  ${input.tempo | output/tempo.json}
+          part:   voice
+          grid:   ${input.grid as text | 4}
+          audio:  ""
+          key:    ${input.key | output/key.json}
+          chords: ${input.chords | output/chords.json}
+          lyrics: ${input.lyrics | output/vocals.lyrics.json}
+          tab:    "false"
+          title:  ${input.title | }
+
+      - id: render
+        component: score-image
+        input:
+          score: ${input.out | output/vocals.musicxml}
+          out:   ${input.image_out | output/vocals}
+        depends_on: [ build ]
+
+    output:
+      score:  ${jobs.build.output.result as json}
+      render: ${jobs.render.output.result as json}
+
+  # ── Phase 3, shared: beats and bars, key, chords ──────────────────────
+  - id: beats
+    title: Track Beats and Bars
+    description: |
+      Find every beat and every bar's first beat in the original mix, and save
+      them to ./output/tempo.json for the engrave stage. Quantization needs a
+      real grid, and the bar lines of every part score come from these
+      downbeats.
+
+      `audio` is a path, e.g. output/01-source.flac.
+    jobs:
+      - id: track
+        component: beat-tracker
+        input:
+          audio: ${input.audio as audio;path}
+
+      - id: save
+        component: store
+        input:
+          path: tempo.json
+          source: ${jobs.track.output as text}
+        depends_on: [ track ]
+
+    output:
+      tempo: ${jobs.save.output}
+      beats: ${jobs.track.output.beats as json}
+
+  - id: key
+    title: Estimate the Key
+    description: |
+      Estimate the song's key from the mix and save it to ./output/key.json,
+      where every part's engraver reads its key signature and spelling. Pass
+      `key` ("C minor", "Ab") to set it instead of estimating.
+
+      `audio` is a path, e.g. output/01-source.flac.
+    jobs:
+      - id: estimate
+        component: key-estimator
+        input:
+          audio: ${input.audio | output/01-source.flac}
+          out:   ${input.out | output/key.json}
+          key:   ${input.key as text | auto}
+
+    output: ${jobs.estimate.output.result as json}
+
+  - id: chords
+    title: Recognize the Chords
+    description: |
+      Recognize the song's chords — sevenths, sixths, sus and diminished
+      included — with BTC, on the beat grid, and save them to
+      ./output/chords.json, where the guitar and vocal parts read their chord
+      symbols. Reads the mix (./output/01-source.flac), ./output/tempo.json
+      and ./output/key.json. The model (34 MB) downloads on first use.
+    jobs:
+      - id: estimate
+        component: chord-estimator
+        input:
+          out:    ${input.out | output/chords.json}
+          audio:  ${input.audio | output/01-source.flac}
+          tempo:  ${input.tempo | output/tempo.json}
+          key:    ${input.key | output/key.json}
+
+    output: ${jobs.estimate.output.result as json}
+
+  # ── Phase 3 ────────────────────────────────────────────────────────────────
+  - id: engrave
+    title: Engrave a Score
+    description: |
+      Build a score from transcription events and render it to SVG, PNG and PDF.
+      Takes the `notes` JSON the transcribe workflow writes, so a score can be
+      re-cut with a different grid or tempo without re-running any model.
+
+      `bpm` defaults to `auto`, which follows the beat times in `tempo`. Pass a
+      number to force a fixed tempo instead.
+    jobs:
+      - id: build
+        component: engraver
+        input:
+          notes:     ${input.notes | output/piano.notes.json}
+          out:       ${input.out | output/piano.musicxml}
+          tempo:     ${input.tempo | output/tempo.json}
+          bpm:       ${input.bpm as text | auto}
+          min_pitch: ${input.min_pitch as text | 36}
+          grid:      ${input.grid as text | 4}
+          key:       ${input.key | output/key.json}
+          title:     ${input.title | }
+
+      - id: render
+        component: score-image
+        input:
+          score: ${input.out | output/piano.musicxml}
+          out:   ${input.image_out | output/piano}
+        depends_on: [ build ]
+
+    output:
+      score:  ${jobs.build.output.result as json}
+      render: ${jobs.render.output.result as json}
+
+  # ── Phase 3b: drum part ──────────────────────────────────────────────────
+  - id: engrave-drums
+    title: Engrave the Drum Part
+    description: |
+      Write a drum part from the pieces split-drums leaves in
+      ./output/stems/drums, on the bar grid in ./output/tempo.json, and render
+      it to SVG, PNG and PDF. Also writes a General MIDI drum file for listening.
+      Rehearsal marks where a crash follows a fill; with ./output/chords.json
+      (the chords workflow), sections playing the same chords share a letter.
+    jobs:
+      - id: build
+        component: drum-engraver
+        input:
+          pieces: ${input.pieces | output/stems/drums}
+          out:    ${input.out | output/drums.musicxml}
+          tempo:  ${input.tempo | output/tempo.json}
+          chords: ${input.chords | output/chords.json}
+          grid:   ${input.grid as text | 4}
+          title:  ${input.title | }
+
+      - id: render
+        component: score-image
+        input:
+          score: ${input.out | output/drums.musicxml}
+          out:   ${input.image_out | output/drums}
+        depends_on: [ build ]
+
+    output:
+      score:  ${jobs.build.output.result as json}
+      render: ${jobs.render.output.result as json}
+
+components:
+  # Runs one of the workflows above as a single job: how `full` calls each
+  # part, and how a part calls its stages. The job's whole input is handed to
+  # the workflow.
+  - id: run
+    type: workflow
+    actions:
+      - { id: download,              workflow: download,              input: "${input}" }
+      - { id: split-drums,           workflow: split-drums,           input: "${input}" }
+      - { id: transcribe,            workflow: transcribe,            input: "${input}" }
+      - { id: transcribe-bass,       workflow: transcribe-bass,       input: "${input}" }
+      - { id: transcribe-guitar,     workflow: transcribe-guitar,     input: "${input}" }
+      - { id: transcribe-vocals,     workflow: transcribe-vocals,     input: "${input}" }
+      - { id: transcribe-lyrics,     workflow: transcribe-lyrics,     input: "${input}" }
+      - { id: engrave,               workflow: engrave,               input: "${input}" }
+      - { id: engrave-drums,         workflow: engrave-drums,         input: "${input}" }
+      - { id: engrave-bass,          workflow: engrave-bass,          input: "${input}" }
+      - { id: engrave-guitar,        workflow: engrave-guitar,        input: "${input}" }
+      - { id: engrave-guitar-rhythm, workflow: engrave-guitar-rhythm, input: "${input}" }
+      - { id: engrave-vocals,        workflow: engrave-vocals,        input: "${input}" }
+      - { id: part-drums,            workflow: part-drums,            input: "${input}" }
+      - { id: part-bass,             workflow: part-bass,             input: "${input}" }
+      - { id: part-guitar,           workflow: part-guitar,           input: "${input}" }
+      - { id: part-piano,            workflow: part-piano,            input: "${input}" }
+      - { id: part-vocals,           workflow: part-vocals,           input: "${input}" }
+
+  # BS-Roformer-SW (jarredou), six stems — model-compose's own
+  # `family: bs-roformer`. Until 0.4.113 this checkpoint could not run here
+  # (four driver defects, fixed in 0.4.113) and a script stood in; the release runs it, with
+  # bs-roformer 0.4.1 or the latest alike (bit-identical stems on a full song).
+  #
+  # The model settings are the checkpoint's; the chunk is the one it was
+  # trained on (588800 samples) with half overlap — the defaults (8 s, 0.25)
+  # give different stems. The weights (~700 MB) download on first run into the
+  # machine-wide HuggingFace cache.
+  #
+  # CPU is slow (about 4x real time on an M1), so set DEVICE=cuda on a GPU
+  # machine. The device is never hard-coded: the same file runs on a Mac, a
+  # DGX Spark and an RTX 4090.
+  - id: stem-splitter
+    type: model
+    task: music-source-separation
+    driver: custom
+    family: bs-roformer
+    model:
+      provider: huggingface
+      repository: Politrees/UVR_resources
+      filename: models/Roformer/BandSplit/model_BandSplit-Roformer_SW_by-jarredou.ckpt
+    stems: [ bass, drums, other, vocals, guitar, piano ]
+    device: ${env.DEVICE | cpu}
+    max_concurrent_count: 1
+    params:
+      dim: 256
+      depth: 12
+      stereo: true
+      num_stems: 6
+      time_transformer_depth: 1
+      freq_transformer_depth: 1
+      heads: 8
+      dim_head: 64
+      flash_attn: true
+      stft_n_fft: 2048
+      stft_hop_length: 512
+      stft_win_length: 2048
+      freqs_per_bands: [ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                         4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+                         12, 12, 12, 12, 12, 12, 12, 12,
+                         24, 24, 24, 24, 24, 24, 24, 24,
+                         48, 48, 48, 48, 48, 48, 48, 48,
+                         128, 129 ]
+    action:
+      audio: ${input.audio}
+      params:
+        chunk_duration: 13.351473922902494   # 588800 / 44100
+        overlap: 0.5
+
+  # MDX23C DrumSep (aufr33 & jarredou, 438 MB) — model-compose's own
+  # `family: mdx23c`, which, unlike the roformer family, runs this checkpoint
+  # as-is. Against AlbumDB's separate kick and snare tracks it recovers 87% of
+  # kick and 100% of snare onsets, whether it is fed the true drum mix, a
+  # BS-Roformer drum stem or a Demucs one.
+  #
+  # num_overlap 2 instead of the example's 4: identical kick/snare results on
+  # that test and 41% less time.
+  - id: drum-splitter
+    type: model
+    task: music-source-separation
+    driver: custom
+    family: mdx23c
+    model:
+      provider: huggingface
+      repository: Politrees/UVR_resources
+      filename: models/MDX23C/MDX23C-DrumSep-aufr33-jarredou.ckpt
+    instruments: [ Kick, Snare, Toms, Hh, Ride, Crash ]
+    device: ${env.DEVICE | cpu}
+    max_concurrent_count: 1
+    action:
+      audio: ${input.audio}
+      params:
+        num_overlap: ${input.num_overlap as integer | 2}
+
+  - id: transcriber
+    type: model
+    task: music-transcription
+    driver: custom
+    # piano-transcription knows only the piano, and hears it better than the
+    # instrument-agnostic basic-pitch below does.
+    family: piano-transcription
+    device: ${env.DEVICE | auto}
+    max_concurrent_count: 1
+    action:
+      audio: ${input.audio}
+      return_midi:  true
+      return_notes: true
+      params:
+        # minimum_note_length / minimum_frequency / maximum_frequency /
+        # return_pitch_bends / midi_tempo do not apply to this family.
+        onset_threshold:        ${input.onset_threshold | 0.3}
+        offset_threshold:       ${input.offset_threshold | 0.3}
+        frame_threshold:        ${input.frame_threshold | 0.1}
+        pedal_offset_threshold: ${input.pedal_offset_threshold | 0.2}
+
+  # basic-pitch (Spotify, ICASSP 2022) for every pitched stem that is not the
+  # piano: it is instrument-agnostic, where piano-transcription only knows the
+  # piano. The pitch range is the part's, passed in per call. The driver runs
+  # the ONNX model the package ships; TensorFlow is never installed.
+  - id: pitch-transcriber
+    type: model
+    task: music-transcription
+    driver: custom
+    family: basic-pitch
+    # ONNX on CPU either way; the device is still resolved, which imports torch.
+    device: ${env.DEVICE | cpu}
+    max_concurrent_count: 1
+    action:
+      audio: ${input.audio}
+      return_midi:  true
+      return_notes: true
+      params:
+        onset_threshold:   ${input.onset_threshold | 0.5}
+        frame_threshold:   ${input.frame_threshold | 0.3}
+        minimum_frequency: ${input.minimum_frequency}
+        maximum_frequency: ${input.maximum_frequency}
+
+  - id: store
+    type: file-store
+    driver: local
+    base_path: ./output
+    action:
+      method: put
+      path: ${input.path}
+      source: ${input.source}
+      # `output` belongs to the action, not the component — at component level it
+      # is accepted by `validate` and then ignored, and the job receives the raw
+      # `{path, url, size, content_type}` dict instead.
+      #
+      # `result.path` comes back relative to `base_path`, so it cannot be
+      # reopened as-is. Prefix it here, once, and every job downstream can feed
+      # the saved file straight back in with `as audio;path`.
+      output: output/${result.path}
+
+  # Engraves the MusicXML to SVG, PNG and a PDF. verovio is a pip-installable
+  # engraver — no MuseScore or LilyPond binary, and its abi3 wheel works on any
+  # Python 3.10+, so this runs the same on macOS and Linux.
+  - id: score-image
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, verovio, cairosvg ]
+    action:
+      command:
+        - python
+        - tools/render_score.py
+        - ${input.score}
+        - ${input.out}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  # Beat This! (ISMIR 2024). Replaces music-analyzer's librosa beat tracker,
+  # for three reasons measured on two songs:
+  #   - it marks each bar's first beat, which is where the bar lines go; librosa
+  #     gives beats only, so bar 1 was simply "the first beat detected"
+  #   - it lands on the right metrical level untuned; librosa needed its
+  #     sample rate and tempo prior hand-set to stop reading 92 BPM as 122
+  #   - it tracks to the end of the song; librosa dropped the last 20 s of one
+  # Beat placement itself was a draw once its fixed ~30 ms lead over librosa
+  # (it marks the attack, librosa the energy peak after it) is accounted for.
+  #
+  # Its beats sit on 50 fps frames, so read tempo off the whole span, never off
+  # the median gap. notes_to_score.py does.
+  - id: beat-tracker
+    type: model
+    task: music-beat-tracking
+    driver: custom
+    family: beat-this
+    # The paper's main checkpoint, ~78 MB. `small0` is ~8 MB if that matters.
+    model: ${env.BEAT_THIS_MODEL | final0}
+    device: ${env.DEVICE | auto}
+    # madmom's DBN assumes one bar length for the whole song and caps tempo
+    # at 215 BPM; the peak picker has neither limit.
+    dbn: false
+    max_concurrent_count: 1
+    action:
+      audio: ${input.audio}
+      return_metadata: true
+
+  # A local recording → FLAC, which copy-source saves as ./output/01-source.flac,
+  # the file the download leaves.
+  - id: source-converter
+    type: audio-converter
+    driver: ffmpeg
+    action:
+      audio: ${input.audio as audio;path}
+      format: flac
+
+  - id: downloader
+    type: media-downloader
+    driver: ytdlp
+    action:
+      url: ${input.url}
+      # flac keeps the source lossless; transcription accuracy depends on it.
+      format: ${input.format | flac}
+
+  # Drum part: onsets per DrumSep piece, gated twice (whole piece, then per
+  # hit) because onset detection normalises each stem and finds "hits" in a
+  # silent one. Percussion staff, crosses for cymbals. See tools/drums_to_score.py.
+  - id: drum-engraver
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, music21, librosa, soundfile, pretty_midi ]
+    action:
+      command:
+        - python
+        - tools/drums_to_score.py
+        - --title=${input.title}
+        - --chords=${input.chords}
+        - ${input.pieces}
+        - ${input.out}
+        - ${input.tempo}
+        - ${input.grid}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  # Single-line parts, the bass and the voice: one note per onset, key
+  # signature from the song's key.json. For the bass, octaves are checked
+  # against the stem and merged repeats split at its attacks; the voice gets
+  # chord symbols above it. See tools/line_to_score.py.
+  - id: line-engraver
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, music21, librosa, soundfile, pretty_midi ]
+    action:
+      command:
+        - python
+        - tools/line_to_score.py
+        - --title=${input.title}
+        - --tab=${input.tab}
+        - --chords=${input.chords}
+        - --lyrics=${input.lyrics}
+        - ${input.notes}
+        - ${input.out}
+        - ${input.tempo}
+        - ${input.part}
+        - ${input.grid}
+        - ${input.audio}
+        - ${input.key}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  - id: engraver
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, music21 ]
+    action:
+      command:
+        - python
+        - tools/notes_to_score.py
+        - --title=${input.title}
+        - ${input.notes}
+        - ${input.out}
+        # `auto` follows the beat times in the tempo file; a number forces a
+        # fixed tempo. Prefer auto — one BPM cannot hold a 16th grid across a
+        # four-minute performance (0.03 BPM of headroom against 0.45 BPM of
+        # real drift). See the docstring in tools/notes_to_score.py.
+        - ${input.bpm}
+        - ${input.min_pitch}
+        - ${input.grid}
+        - ${input.tempo}
+        # The song's key from the key stage; a missing file means no key
+        # signature, as before.
+        - ${input.key}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  # The song's key from the mix, once, for every part: HPSS harmonic part,
+  # constant-Q chroma, Krumhansl-Kessler profiles. model-compose's
+  # music-analyzer has a `key` metric too, but on the full mix (CENS chroma)
+  # it called a C minor song C major, and it names keys with sharps only
+  # ("G#" for A-flat), which would print an eight-sharp signature. See
+  # tools/estimate_key.py.
+  - id: key-estimator
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, librosa, soundfile, numpy ]
+    action:
+      command:
+        - python
+        - tools/estimate_key.py
+        - ${input.audio}
+        - ${input.out}
+        - ${input.key}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  # The song's chords, once, for every part: BTC (Park et al., ISMIR 2019,
+  # MIT), a chord transformer with a 170-chord vocabulary, on the mix; its
+  # chords laid on the half-beat grid, none shorter than a beat. Against
+  # purchased parts (29 songs) it agreed better than the stem-chroma
+  # estimator it replaces (tools/estimate_chords.py): maj/min 0.72 vs 0.67,
+  # sevenths 0.56 vs 0.50. See tools/recognize_chords.py.
+  # torch is not listed: the separators install it, and a second unpinned
+  # install here would race theirs.
+  - id: chord-estimator
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, librosa, soundfile, numpy, music21, mir_eval, pyyaml ]
+    action:
+      command:
+        - python
+        - tools/recognize_chords.py
+        - ${input.out}
+        - ${input.audio}
+        - ${input.tempo}
+        - ${input.key}
+      timeout: 600.0
+      output:
+        result: ${result.stdout as json}
+
+  # Guitar part: every pitch that starts on one grid position stays, as a
+  # chord; chord symbols from chords.json above the staff. See
+  # tools/guitar_to_score.py.
+  - id: guitar-engraver
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, music21, librosa, soundfile, pretty_midi ]
+    action:
+      command:
+        - python
+        - tools/guitar_to_score.py
+        - --title=${input.title}
+        - --tab=${input.tab}
+        - ${input.notes}
+        - ${input.out}
+        - ${input.tempo}
+        - ${input.grid}
+        - ${input.audio}
+        - ${input.key}
+        - ${input.chords}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  # GAME (openvpi, MIT), a singing transcriber: note boundaries by discrete
+  # diffusion, a pitch per note. basic-pitch, model-compose's own, is made for
+  # instruments; against purchased melody lines GAME agreed on 0.69 of the
+  # notes where basic-pitch did on 0.53 (six songs). Its ONNX release runs on
+  # ONNX Runtime alone, on the CPU — 13 s for a 3.4-minute song on an M1.
+  # The guitar's rhythm chart: percussive onsets of the guitar stem on 8th
+  # notes as rhythm slashes, the chord symbols above. Against the slashes of
+  # purchased parts it matched 0.93 of the strums, the note-by-note guitar
+  # part 0.41. See tools/rhythm_to_score.py.
+  - id: rhythm-engraver
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, music21, librosa, soundfile, numpy, pretty_midi ]
+    action:
+      command:
+        - python
+        - tools/rhythm_to_score.py
+        - --title=${input.title}
+        - ${input.audio}
+        - ${input.out}
+        - ${input.tempo}
+        - ${input.key}
+        - ${input.chords}
+      timeout: 300.0
+      output:
+        result: ${result.stdout as json}
+
+  - id: vocal-transcriber
+    type: shell
+    manage:
+      scripts:
+        install:
+          - [ python, -m, pip, install, --quiet, onnxruntime, librosa, soundfile, numpy ]
+    action:
+      command:
+        - python
+        - tools/transcribe_vocals.py
+        - ${input.audio}
+        - ${input.out}
+        - ${input.model}
+        - ${input.language}
+      timeout: 1800.0
+      output:
+        result: ${result.stdout as json}
+
+  # Where the singing is: the sung notes joined across short rests, as spans
+  # for the lyrics transcriber — and the language code, or null when it was
+  # left empty (an empty workflow input renders as a blank, which Whisper
+  # rejects). See tools/sung_spans.py.
+  - id: span-finder
+    type: shell
+    action:
+      command:
+        - python
+        - tools/sung_spans.py
+        - ${input.notes}
+        - ${input.language}
+      output:
+        result: ${result.stdout as json}
+
+  # Whisper over the sung stretches only: model-compose's speech-to-text
+  # component (faster-whisper), told where to listen with `span`. CPU int8 by
+  # default — CTranslate2 has no CUDA build for Linux on ARM (a DGX Spark), and
+  # a Mac has no CUDA; on an x86 NVIDIA box LYRICS_DEVICE=cuda is faster.
+  - id: lyrics-transcriber
+    type: model
+    task: speech-to-text
+    driver: custom
+    family: faster-whisper
+    model: ${env.LYRICS_MODEL | dropbox-dash/faster-whisper-large-v3-turbo}
+    device: ${env.LYRICS_DEVICE | cpu}
+    compute_type: int8
+    max_concurrent_count: 1
+    action:
+      audio: ${input.audio}
+      language: ${input.language}
+      span: ${input.span}
+      return_timestamps: true
+      timestamp_level: word
+      params:
+        num_beams: 1
+        temperature: 0.0
+        condition_on_previous_text: false
